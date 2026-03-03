@@ -16,8 +16,8 @@ use libsignal_service::{
     proto::{
         data_message::Delete,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
-        Verified,
+        typing_message, AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage,
+        SyncMessage, TypingMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -993,6 +993,7 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
 
         // save the message
+        let needs_receipt = expects_receipt(&content_body);
         let content = Content {
             metadata: Metadata {
                 sender: self.state.data.service_ids.aci().into(),
@@ -1000,7 +1001,7 @@ impl<S: Store> Manager<S, Registered> {
                 destination: recipient,
                 server_guid: None,
                 timestamp,
-                needs_receipt: false,
+                needs_receipt,
                 unidentified_sender: false,
                 was_plaintext: false,
             },
@@ -1015,6 +1016,48 @@ impl<S: Store> Manager<S, Registered> {
             Some(thread),
         )
         .await?;
+
+        Ok(())
+    }
+
+    /// Sends a typing indicator to a contact.
+    ///
+    /// This is a best-effort operation and does not save anything to the store.
+    ///
+    /// For group typing indicators, use [`send_typing_to_group`](Self::send_typing_to_group).
+    pub async fn send_typing(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        started: bool,
+    ) -> Result<(), Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+        let recipient = recipient.into();
+
+        let (typing_message, timestamp) = make_typing_message(started, None);
+
+        let sender_certificate = self.sender_certificate().await?;
+        let unidentified_access = self
+            .store
+            .profile_key(&recipient)
+            .await?
+            .map(|profile_key| UnidentifiedAccess {
+                key: profile_key.derive_access_key().to_vec(),
+                certificate: sender_certificate.clone(),
+            });
+
+        let online_only = true; // Typing indicators are ephemeral
+        let include_pni_signature = false;
+
+        sender
+            .send_message(
+                &recipient,
+                unidentified_access,
+                typing_message,
+                timestamp,
+                online_only,
+                include_pni_signature,
+            )
+            .await?;
 
         Ok(())
     }
@@ -1119,6 +1162,7 @@ impl<S: Store> Manager<S, Registered> {
             })
             .transpose()?;
 
+        let needs_receipt = expects_receipt(&content_body);
         let content = Content {
             metadata: Metadata {
                 sender: self.state.data.service_ids.aci().into(),
@@ -1126,7 +1170,7 @@ impl<S: Store> Manager<S, Registered> {
                 sender_device: self.state.device_id(),
                 server_guid: None,
                 timestamp,
-                needs_receipt: false, // TODO: this is just wrong
+                needs_receipt,
                 unidentified_sender: false,
                 was_plaintext: false,
             },
@@ -1141,6 +1185,84 @@ impl<S: Store> Manager<S, Registered> {
             Some(thread),
         )
         .await?;
+
+        Ok(())
+    }
+
+    /// Sends a typing indicator to a group.
+    ///
+    /// This is a best-effort operation: if some group members are unreachable
+    /// (e.g., deleted accounts), they are silently skipped.
+    ///
+    /// For 1:1 typing indicators, use [`send_typing`](Self::send_typing).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `master_key_bytes` is not exactly 32 bytes.
+    pub async fn send_typing_to_group(
+        &mut self,
+        master_key_bytes: &[u8],
+        started: bool,
+    ) -> Result<(), Error<S::Error>> {
+        let master_key_bytes: [u8; 32] = master_key_bytes
+            .try_into()
+            .expect("Master key bytes to be of size 32.");
+
+        let mut sender = self.new_message_sender().await?;
+
+        let mut groups_manager = self.groups_manager()?;
+        let Some(group) =
+            upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &0).await?
+        else {
+            return Err(Error::UnknownGroup);
+        };
+
+        // Derive group identifier from master key
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
+        let group_id = group_secret_params.get_group_identifier().to_vec();
+
+        let (typing_message, timestamp) = make_typing_message(started, Some(group_id));
+
+        let sender_certificate = self.sender_certificate().await?;
+        let mut recipients = Vec::new();
+        for member in group
+            .members
+            .into_iter()
+            .filter(|m| m.aci != self.state.data.service_ids.aci())
+        {
+            let unidentified_access =
+                self.store
+                    .profile_key(&member.aci.into())
+                    .await?
+                    .map(|profile_key| UnidentifiedAccess {
+                        key: profile_key.derive_access_key().to_vec(),
+                        certificate: sender_certificate.clone(),
+                    });
+            let include_pni_signature = false;
+            recipients.push((
+                member.aci.into(),
+                unidentified_access,
+                include_pni_signature,
+            ));
+        }
+
+        let online_only = true; // Typing indicators are ephemeral
+        let results = sender
+            .send_message_to_group(recipients, typing_message, timestamp, online_only)
+            .await;
+
+        // Typing indicators are ephemeral and best-effort. If a group member has
+        // deleted their account or is otherwise unreachable (NotFound), we silently
+        // skip them rather than failing the entire operation.
+        results
+            .into_iter()
+            .find(|res| match res {
+                Ok(_) => false,
+                Err(MessageSenderError::NotFound { .. }) => false,
+                Err(_) => true,
+            })
+            .transpose()?;
 
         Ok(())
     }
@@ -1875,4 +1997,34 @@ async fn register_pre_keys<S: Store>(
 
     trace!("registered pre keys");
     Ok(())
+}
+
+/// Creates a typing message with the current timestamp.
+fn make_typing_message(started: bool, group_id: Option<Vec<u8>>) -> (TypingMessage, u64) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64;
+
+    let action = if started {
+        typing_message::Action::Started
+    } else {
+        typing_message::Action::Stopped
+    };
+
+    let typing_message = TypingMessage {
+        timestamp: Some(timestamp),
+        action: Some(action.into()),
+        group_id,
+    };
+
+    (typing_message, timestamp)
+}
+
+/// Returns whether a message type expects delivery/read receipts.
+///
+/// DataMessages (regular messages) expect receipts, while ephemeral message types
+/// like typing indicators and receipts themselves do not.
+fn expects_receipt(content_body: &ContentBody) -> bool {
+    matches!(content_body, ContentBody::DataMessage(_))
 }
